@@ -24,7 +24,7 @@ MFRC522::MIFARE_Key key;
 MFRC522::StatusCode status;
 
 const char* ssid = "ESP32-Access-Point";
-const char* password = "nwakaeme";    // Anthony Nwakaeme respect
+const char* password = "nwakaeme";    // Respect to Anthony Nnaduzor Nwakaeme
 WiFiServer server(80);
 
 // Veri yapıları
