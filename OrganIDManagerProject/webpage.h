@@ -1,12 +1,18 @@
 #ifndef WEBPAGE_H
 #define WEBPAGE_H
 
-// Fonksiyonu String döndürecek şekilde güncelledik (return edilen String'in .c_str()’i kullanılabilir)
+// Fonksiyonu String döndürecek şekilde güncelledik (return edilen String'in .c_str()'i kullanılabilir)
 String createHtmlPage(const String& tagValue, bool isVeriKontrol, bool isKimlikGuncelle = false, bool isKimlikBelirleme = false, const String& selectedOrgan = "KALP") {
   String html;
   html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   html += "<title>Tag Arayüzü</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  
+  // Veri Kontrol sayfası için her 1 saniyede bir yenileme yapan meta tag
+  if (isVeriKontrol) {
+    html += "<meta http-equiv='refresh' content='1'>";
+  }
+  
   html += "<style>";
   html += "body{font-family:Arial;text-align:center;margin:20px;background-color:#f0f0f0}";
   html += ".organ{display:inline-block;margin:20px;padding:20px;border:3px solid #ff0000;border-radius:15px;background-color:white;transition:all 0.3s ease}";
@@ -39,31 +45,6 @@ String createHtmlPage(const String& tagValue, bool isVeriKontrol, bool isKimlikG
     html += "<div class='organ-icon'>🍀</div>";
     html += "</div>";
     
-    html += "<script>";
-    html += "function checkStatus() {";
-    html += "  fetch(window.location.href).then(response => response.text()).then(html => {";
-    html += "    const tempDiv = document.createElement('div');";
-    html += "    tempDiv.innerHTML = html;";
-    html += "    const activeElement = tempDiv.querySelector('.active');";
-    html += "    const currentActive = document.querySelector('.active');";
-    
-    html += "    if (activeElement && !currentActive) {";
-    html += "      const organId = activeElement.id;";
-    html += "      const targetElement = document.getElementById(organId);";
-    html += "      if (targetElement) {";
-    html += "        targetElement.classList.add('active');";
-    html += "        targetElement.querySelector('.organ-title').innerHTML = targetElement.querySelector('.organ-title').innerHTML.replace('×', '✓');";
-    html += "        setTimeout(() => {";
-    html += "          targetElement.classList.remove('active');";
-    html += "          targetElement.querySelector('.organ-title').innerHTML = targetElement.querySelector('.organ-title').innerHTML.replace('✓', '×');";
-    html += "        }, 2000);";
-    html += "      }";
-    html += "    }";
-    html += "  });";
-    html += "}";
-    html += "setInterval(checkStatus, 500);";
-    html += "</script>";
-        
     html += "<form action='/' method='GET'><input type='submit' value='Geri Dön' class='button'></form>";
   } 
   else if (isKimlikGuncelle) {
@@ -85,7 +66,7 @@ String createHtmlPage(const String& tagValue, bool isVeriKontrol, bool isKimlikG
     html += "<script>";
     html += "let lastStatus = '';";
     html += "function checkCardStatus() {";
-    html += "  fetch('/cardstatus').then(response => response.text()).then(status => {";
+    html += "  fetch('/cardstatus?' + new Date().getTime()).then(response => response.text()).then(status => {";
     html += "    const statusElement = document.getElementById('status');";
     html += "    if (status === 'Kimliksiz Kart! İşlem iptal edildi.') {";
     html += "      if (lastStatus !== status) {";
@@ -125,7 +106,7 @@ String createHtmlPage(const String& tagValue, bool isVeriKontrol, bool isKimlikG
     
     html += "<script>";
     html += "function checkCardStatus() {";
-    html += "  fetch('/cardstatus').then(response => response.text()).then(status => {";
+    html += "  fetch('/cardstatus?' + new Date().getTime()).then(response => response.text()).then(status => {";
     html += "    document.getElementById('status').innerHTML = status;";
     html += "  });";
     html += "}";

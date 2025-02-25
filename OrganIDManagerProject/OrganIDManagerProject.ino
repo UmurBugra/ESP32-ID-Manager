@@ -95,193 +95,261 @@ bool handleKimlikBelirleme(MFRC522::StatusCode status, byte buffer[], byte size)
 
 void rfidTask(void* parameter) {
   String lastReadTag = "";
+  String currentCardContent = "";
   unsigned long lastReadTime = 0;
-  const TickType_t xDelay = pdMS_TO_TICKS(50);
-  const unsigned long READ_DELAY = 2000;
-
+  unsigned long lastCardCheck = 0;
+  bool cardPresent = false;
+  const unsigned long CHECK_INTERVAL = 100;
+  const unsigned long CARD_OP_CHECK_INTERVAL = 300; 
+  unsigned long lastCardOpCheck = 0; 
  
   for (byte i = 0; i < 6; i++) {
     key.keyByte[i] = 0xFF;
   }
 
+  mfrc522.PCD_Init();
+  
   for (;;) {
     unsigned long currentTime = millis();
     
-    if (currentTime - lastReadTime < READ_DELAY) {
-      vTaskDelay(xDelay);
-      continue;
+    bool isCardOperation = false;
+    if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      isCardOperation = cardOp.isUpdateRequested || writeRequested;
+      xSemaphoreGive(cardOpMutex);
     }
-
-    if (!mfrc522.PICC_IsNewCardPresent()) {
-      vTaskDelay(xDelay);
-      continue;
-    }
-
-    if (!mfrc522.PICC_ReadCardSerial()) {
-      vTaskDelay(xDelay);
-      continue;
-    }
-
-    String currentUID = "";
-    for (byte i = 0; i < mfrc522.uid.size; i++) {
-      currentUID += String(mfrc522.uid.uidByte[i], HEX);
-    }
-
-    if (currentUID == lastReadTag && (currentTime - lastReadTime < 5000)) {
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-      vTaskDelay(xDelay);
-      continue;
-    }
-
-    Serial.println("\n------------------------------------------");
-    Serial.println("Kart Tespit Edildi!");
-    Serial.print("Kart UID: ");
-    for (byte i = 0; i < mfrc522.uid.size; i++) {
-      Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
-      Serial.print(mfrc522.uid.uidByte[i], HEX);
-    }
-    Serial.println();
-
-    if ((cardOp.isUpdateRequested || writeRequested) && !cardOp.isProcessing) {
-      Serial.println("Kimlik işlemi başlatılıyor...");
-      if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-        cardOp.isProcessing = true;
-        xSemaphoreGive(cardOpMutex);
-      }
+    
+    if (isCardOperation && (currentTime - lastCardOpCheck >= CARD_OP_CHECK_INTERVAL)) {
+      lastCardOpCheck = currentTime;
       
-      byte buffer[18];
-      byte size = sizeof(buffer);
+      mfrc522.PCD_Init();
       
-      status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, BASLANGIC_BLOK, &key, &(mfrc522.uid));
-      if (status != MFRC522::STATUS_OK) {
-        if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-          cardOp.status = "Kimlik doğrulama hatası!";
-          cardOp.isProcessing = false;
-          xSemaphoreGive(cardOpMutex);
-        }
-        Serial.println("Hata: Kimlik doğrulama başarısız!");
-        mfrc522.PICC_HaltA();
-        mfrc522.PCD_StopCrypto1();
-        vTaskDelay(xDelay);
-        continue;
-      }
-
-      status = mfrc522.MIFARE_Read(BASLANGIC_BLOK, buffer, &size);
-      if (status != MFRC522::STATUS_OK) {
-        if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-          cardOp.status = "Okuma hatası!";
-          cardOp.isProcessing = false;
-          xSemaphoreGive(cardOpMutex);
-        }
-        Serial.println("Hata: Kart okunamadı!");
-        mfrc522.PICC_HaltA();
-        mfrc522.PCD_StopCrypto1();
-        vTaskDelay(xDelay);
-        continue;
-      }
-
-      if (writeRequested) {
-        if (!handleKimlikBelirleme(status, buffer, size)) {
-          mfrc522.PICC_HaltA();
-          mfrc522.PCD_StopCrypto1();
-          vTaskDelay(xDelay);
-          continue;
-        }
-      } else if (cardOp.isUpdateRequested) {
-        bool isEmpty = true;
-        for (byte i = 0; i < 16; i++) {
-          if (buffer[i] != 0) {
-            isEmpty = false;
-            break;
+      if (!cardOp.isProcessing) {
+        if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+          Serial.println("\n------------------------------------------");
+          Serial.println("Kimlik işlemi için kart algılandı.");
+          Serial.print("Kart UID: ");
+          for (byte i = 0; i < mfrc522.uid.size; i++) {
+            Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+            Serial.print(mfrc522.uid.uidByte[i], HEX);
           }
-        }
-
-        if (isEmpty) {
-          if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-            cardOp.status = "Kimliksiz Kart! İşlem iptal edildi.";
-            cardOp.isUpdateRequested = false;
-            cardOp.isProcessing = false;
-            xSemaphoreGive(cardOpMutex);
-          }
-          Serial.println("Durum: Kimliksiz Kart tespit edildi - İşlem sonlandırılıyor");
-          mfrc522.PICC_HaltA();
-          mfrc522.PCD_StopCrypto1();
-          vTaskDelay(xDelay);
-          continue;
-        }
-
-        Serial.println("Mevcut içerik siliniyor...");
-        byte clearBuffer[16] = {0};
-        status = mfrc522.MIFARE_Write(BASLANGIC_BLOK, clearBuffer, 16);
-        if (status != MFRC522::STATUS_OK) {
-          if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-            cardOp.status = "Silme hatası!";
-            cardOp.isProcessing = false;
-            xSemaphoreGive(cardOpMutex);
-          }
-          Serial.println("Hata: Kart içeriği silinemedi!");
-          mfrc522.PICC_HaltA();
-          mfrc522.PCD_StopCrypto1();
-          vTaskDelay(xDelay);
-          continue;
-        }
-
-        Serial.println("Yeni kimlik yazılıyor: " + cardOp.newValue);
-        byte writeBuffer[16] = {0};
-        cardOp.newValue.getBytes(writeBuffer, 16);
-        status = mfrc522.MIFARE_Write(BASLANGIC_BLOK, writeBuffer, 16);
-        if (status != MFRC522::STATUS_OK) {
-          if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-            cardOp.status = "Yazma hatası!";
-            cardOp.isProcessing = false;
-            xSemaphoreGive(cardOpMutex);
-          }
-          Serial.println("Hata: Yeni kimlik yazılamadı!");
-        } else {
-          if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
-            cardOp.status = "Kimlik güncellendi!";
-            cardOp.isUpdateRequested = false;
-            cardOp.isProcessing = false;
-            xSemaphoreGive(cardOpMutex);
-          }
-          Serial.println("Başarılı: Kimlik güncellendi!");
-        }
-      }
-      
-    } else {
-      byte buffer[18];
-      byte size = sizeof(buffer);
-      
-      status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, BASLANGIC_BLOK, &key, &(mfrc522.uid));
-      if (status == MFRC522::STATUS_OK) {
-        status = mfrc522.MIFARE_Read(BASLANGIC_BLOK, buffer, &size);
-        if (status == MFRC522::STATUS_OK) {
-          TagData newTag;
-          String content = "";
-          for (byte i = 0; i < 16 && buffer[i] != 0; i++) {
-            content += (char)buffer[i];
-          }
-          newTag.content = content;
-          newTag.timestamp = currentTime;
-          xQueueSend(tagQueue, &newTag, pdMS_TO_TICKS(100));
+          Serial.println();
           
-          Serial.print("Okunan içerik: ");
-          Serial.println(content.length() > 0 ? content : "(Boş)");
-        } else {
-          Serial.println("Hata: Kart okunamadı!");
+          if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+            cardOp.isProcessing = true;
+            xSemaphoreGive(cardOpMutex);
+          }
+          
+          byte buffer[18];
+          byte size = sizeof(buffer);
+          
+          status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, BASLANGIC_BLOK, &key, &(mfrc522.uid));
+          if (status != MFRC522::STATUS_OK) {
+            if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+              cardOp.status = "Kimlik doğrulama hatası!";
+              cardOp.isProcessing = false;
+              xSemaphoreGive(cardOpMutex);
+            }
+            Serial.println("Hata: Kimlik doğrulama başarısız!");
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+          }
+          
+          status = mfrc522.MIFARE_Read(BASLANGIC_BLOK, buffer, &size);
+          if (status != MFRC522::STATUS_OK) {
+            if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+              cardOp.status = "Okuma hatası!";
+              cardOp.isProcessing = false;
+              xSemaphoreGive(cardOpMutex);
+            }
+            Serial.println("Hata: Kart okunamadı!");
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+          }
+          
+          if (writeRequested) {
+            if (!handleKimlikBelirleme(status, buffer, size)) {
+              mfrc522.PICC_HaltA();
+              mfrc522.PCD_StopCrypto1();
+              vTaskDelay(pdMS_TO_TICKS(50));
+              continue;
+            }
+            
+            currentCardContent = cardOp.newValue;
+            
+            TagData newTag;
+            newTag.content = cardOp.newValue;
+            newTag.timestamp = currentTime;
+            
+            xQueueReset(tagQueue);
+            xQueueSend(tagQueue, &newTag, pdMS_TO_TICKS(100));
+            
+            cardPresent = true;
+            lastCardCheck = currentTime;
+          } else if (cardOp.isUpdateRequested) {
+            bool isEmpty = true;
+            for (byte i = 0; i < 16; i++) {
+              if (buffer[i] != 0) {
+                isEmpty = false;
+                break;
+              }
+            }
+
+            if (isEmpty) {
+              if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+                cardOp.status = "Kimliksiz Kart! İşlem iptal edildi.";
+                cardOp.isUpdateRequested = false;
+                cardOp.isProcessing = false;
+                xSemaphoreGive(cardOpMutex);
+              }
+              Serial.println("Durum: Kimliksiz Kart tespit edildi - İşlem sonlandırılıyor");
+              mfrc522.PICC_HaltA();
+              mfrc522.PCD_StopCrypto1();
+              vTaskDelay(pdMS_TO_TICKS(50));
+              continue;
+            }
+
+            Serial.println("Mevcut içerik siliniyor...");
+            byte clearBuffer[16] = {0};
+            status = mfrc522.MIFARE_Write(BASLANGIC_BLOK, clearBuffer, 16);
+            if (status != MFRC522::STATUS_OK) {
+              if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+                cardOp.status = "Silme hatası!";
+                cardOp.isProcessing = false;
+                xSemaphoreGive(cardOpMutex);
+              }
+              Serial.println("Hata: Kart içeriği silinemedi!");
+              mfrc522.PICC_HaltA();
+              mfrc522.PCD_StopCrypto1();
+              vTaskDelay(pdMS_TO_TICKS(50));
+              continue;
+            }
+
+            Serial.println("Yeni kimlik yazılıyor: " + cardOp.newValue);
+            byte writeBuffer[16] = {0};
+            cardOp.newValue.getBytes(writeBuffer, 16);
+            status = mfrc522.MIFARE_Write(BASLANGIC_BLOK, writeBuffer, 16);
+            if (status != MFRC522::STATUS_OK) {
+              if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+                cardOp.status = "Yazma hatası!";
+                cardOp.isProcessing = false;
+                xSemaphoreGive(cardOpMutex);
+              }
+              Serial.println("Hata: Yeni kimlik yazılamadı!");
+            } else {
+              if(xSemaphoreTake(cardOpMutex, portMAX_DELAY) == pdTRUE) {
+                cardOp.status = "Kimlik güncellendi!";
+                cardOp.isUpdateRequested = false;
+                cardOp.isProcessing = false;
+                xSemaphoreGive(cardOpMutex);
+              }
+              Serial.println("Başarılı: Kimlik güncellendi!");
+              
+              currentCardContent = cardOp.newValue;
+              
+              TagData newTag;
+              newTag.content = cardOp.newValue;
+              newTag.timestamp = currentTime;
+              
+              xQueueReset(tagQueue);
+              xQueueSend(tagQueue, &newTag, pdMS_TO_TICKS(100));
+              
+              cardPresent = true;
+              lastCardCheck = currentTime;
+            }
+          }
+          
+          mfrc522.PICC_HaltA();
+          mfrc522.PCD_StopCrypto1();
         }
-      } else {
-        Serial.println("Hata: Kimlik doğrulama başarısız!");
       }
     }
+    
+    if (!isCardOperation && (currentTime - lastReadTime >= CHECK_INTERVAL)) {
+      lastReadTime = currentTime;
 
-    Serial.println("------------------------------------------\n");
-    lastReadTag = currentUID;
-    lastReadTime = currentTime;
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
-    vTaskDelay(pdMS_TO_TICKS(200));
+      mfrc522.PCD_Init();
+  
+      if (mfrc522.PICC_IsNewCardPresent()) {
+        if (mfrc522.PICC_ReadCardSerial()) {
+   
+          String currentUID = "";
+          for (byte i = 0; i < mfrc522.uid.size; i++) {
+            currentUID += String(mfrc522.uid.uidByte[i], HEX);
+          }
+          
+          if (!cardPresent) {
+            Serial.println("\n------------------------------------------");
+            Serial.println("Kart Tespit Edildi!");
+            Serial.print("Kart UID: ");
+            for (byte i = 0; i < mfrc522.uid.size; i++) {
+              Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+              Serial.print(mfrc522.uid.uidByte[i], HEX);
+            }
+            Serial.println();
+          }
+          
+          lastCardCheck = currentTime;
+          
+          byte buffer[18];
+          byte size = sizeof(buffer);
+      
+          status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, BASLANGIC_BLOK, &key, &(mfrc522.uid));
+          if (status == MFRC522::STATUS_OK) {
+      
+            status = mfrc522.MIFARE_Read(BASLANGIC_BLOK, buffer, &size);
+            if (status == MFRC522::STATUS_OK) {
+  
+              String content = "";
+              for (byte i = 0; i < 16 && buffer[i] != 0; i++) {
+                content += (char)buffer[i];
+              }
+              
+              if (!cardPresent || content != currentCardContent) {
+                currentCardContent = content;
+                
+                Serial.print("Kart algılandı. Okunan içerik: ");
+                Serial.println(content.length() > 0 ? content : "(Boş)");
+    
+                TagData newTag;
+                newTag.content = content;
+                newTag.timestamp = currentTime;
+                
+                xQueueReset(tagQueue);
+                xQueueSend(tagQueue, &newTag, pdMS_TO_TICKS(100));
+                
+                cardPresent = true;
+              }
+            }
+          }
+          
+          mfrc522.PICC_HaltA();
+          mfrc522.PCD_StopCrypto1();
+        }
+      }
+      
+      if (cardPresent && (currentTime - lastCardCheck >= 1000)) {
+
+        if (currentCardContent.length() > 0) {
+          Serial.println("Kart algılanamıyor, sıfırlanıyor.");
+          
+          TagData emptyTag;
+          emptyTag.content = "";
+          emptyTag.timestamp = currentTime;
+          
+          xQueueReset(tagQueue);
+          xQueueSend(tagQueue, &emptyTag, 0);
+          
+          currentCardContent = "";
+          cardPresent = false;
+        }
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -294,19 +362,40 @@ void dataProcessTask(void* parameter) {
   while (1) {
     unsigned long currentTime = millis();
     
-    if (!tagActive && xQueueReceive(tagQueue, &receivedTag, pdMS_TO_TICKS(50)) == pdTRUE) {
-      if (lastProcessedTag != receivedTag.content) {
-        if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(tagQueue, &receivedTag, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (receivedTag.content != lastProcessedTag) {
+          if (receivedTag.content.length() > 0) {
+        
+            if (!tagActive) {
+              Serial.println("------------------------------------------");
+              Serial.println("Kart aktif.");
+              tagActive = true;
+            }
+          } else {
+         
+            if (tagActive) {
+              Serial.println("Kart deaktif edildi.");
+              tagActive = false;
+            }
+          }
+          
           lastProcessedTag = receivedTag.content;
-          lastTagTime = currentTime;
-          tagActive = true;
-          xQueueSend(tagQueue, &receivedTag, 0);
-          xSemaphoreGive(dataAccessMutex);
         }
+        
+        lastTagTime = currentTime;
+        xQueueSend(tagQueue, &receivedTag, 0);
+        
+        xSemaphoreGive(dataAccessMutex);
       }
     }
-
-    if (tagActive && (currentTime - lastTagTime >= 2000)) {
+    
+    bool isCardOperation = false;
+    if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      isCardOperation = cardOp.isUpdateRequested || writeRequested;
+      xSemaphoreGive(cardOpMutex);
+    }
+    if (!isCardOperation && tagActive && (currentTime - lastTagTime >= 2000)) {
       if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         TagData emptyTag;
         emptyTag.content = "";
@@ -319,29 +408,41 @@ void dataProcessTask(void* parameter) {
       }
     }
     
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
-
 void webServerTask(void* parameter) {
   server.begin();
   String lastTag = "";
   bool updateRequested = false;
   bool localWriteRequested = false;
   String selectedOrgan = "KALP";
+  unsigned long lastCheck = 0;
   
   while (1) {
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastCheck > 200) { 
+      if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        TagData tag;
+        if (xQueuePeek(tagQueue, &tag, 0) == pdTRUE) {
+          lastTag = tag.content;
+        }
+        xSemaphoreGive(dataAccessMutex);
+      }
+      lastCheck = currentTime;
+    }
+    
     WiFiClient client = server.available();
     if (client) {
       String currentLine = "";
       String request = "";
       String currentTag = "";
-      
+    
       if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         TagData tag;
         if (xQueuePeek(tagQueue, &tag, 0) == pdTRUE) {
           currentTag = tag.content;
-          lastTag = currentTag;
         }
         xSemaphoreGive(dataAccessMutex);
       }
@@ -355,10 +456,13 @@ void webServerTask(void* parameter) {
               bool isVeriKontrol = (request.indexOf("GET /?action=veriKontrol") >= 0);
               bool isKimlikGuncelle = (request.indexOf("GET /?action=kimlikGuncelle") >= 0);
               bool isKimlikBelirleme = (request.indexOf("GET /?action=kimlikBelirleme") >= 0);
-              
+      
               if (request.indexOf("GET /cardstatus") >= 0) {
                 client.println("HTTP/1.1 200 OK");
                 client.println("Content-Type: text/plain");
+                client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+                client.println("Pragma: no-cache");
+                client.println("Expires: 0");
                 client.println("Connection: close");
                 client.println();
                 
@@ -382,6 +486,24 @@ void webServerTask(void* parameter) {
                   }
                   xSemaphoreGive(cardOpMutex);
                 }
+                break;
+              }
+              
+              if (request.indexOf("GET /tagstatus") >= 0) {
+                client.println("HTTP/1.1 200 OK");
+                client.println("Content-Type: text/plain");
+                client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+                client.println("Pragma: no-cache");
+                client.println("Expires: 0");
+                client.println("Connection: close");
+                client.println();
+                
+                // Debug bilgisi
+                Serial.print("Tag durumu sorgulandı, şu anki değer: [");
+                Serial.print(currentTag);
+                Serial.println("]");
+                
+                client.println(currentTag);  
                 break;
               }
               
@@ -455,7 +577,7 @@ void webServerTask(void* parameter) {
       delay(1);
       client.stop();
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));  
   }
 }
 
@@ -497,5 +619,6 @@ void setup() {
   xTaskCreatePinnedToCore(dataProcessTask, "Data_Process", 4096, NULL, 1, &dataProcessTaskHandle, 0);
   xTaskCreatePinnedToCore(webServerTask, "Web_Server", 8192, NULL, 1, &webServerTaskHandle, 1);
 }
+
 void loop() {
 }
