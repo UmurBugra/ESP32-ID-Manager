@@ -4,6 +4,7 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include "webpage.h" 
 
 #define RST_PIN 22
@@ -25,7 +26,10 @@ MFRC522::StatusCode status;
 
 const char* ssid = "ESP32-Access-Point";
 const char* password = "nwakaeme";    // Respect to Anthony Nnaduzor Nwakaeme
-WiFiServer server(80);
+WebServer server(80); 
+
+
+String currentTagValue = "";
 
 // Veri yapıları
 struct TagData {
@@ -48,7 +52,12 @@ struct CardOperation {
 CardOperation cardOp = {false, "", false, ""};
 volatile bool writeRequested = false;
 
+// /tag-durumu endpoint kontrol
+void handleTagDurumu() {
+  server.send(200, "text/plain", currentTagValue);
+}
 
+// Boş bir karta kimlik yazma fonksiyonu
 bool handleKimlikBelirleme(MFRC522::StatusCode status, byte buffer[], byte size) {
  
   String currentContent = "";
@@ -93,6 +102,7 @@ bool handleKimlikBelirleme(MFRC522::StatusCode status, byte buffer[], byte size)
   return true;
 }
 
+// RFID işlemleri
 void rfidTask(void* parameter) {
   String lastReadTag = "";
   String currentCardContent = "";
@@ -179,6 +189,8 @@ void rfidTask(void* parameter) {
             }
             
             currentCardContent = cardOp.newValue;
+            // Global değişkeni güncelle
+            currentTagValue = cardOp.newValue;
             
             TagData newTag;
             newTag.content = cardOp.newValue;
@@ -249,6 +261,8 @@ void rfidTask(void* parameter) {
               Serial.println("Başarılı: Kimlik güncellendi!");
               
               currentCardContent = cardOp.newValue;
+              // Global değişkeni güncelle
+              currentTagValue = cardOp.newValue;
               
               TagData newTag;
               newTag.content = cardOp.newValue;
@@ -310,6 +324,8 @@ void rfidTask(void* parameter) {
               
               if (!cardPresent || content != currentCardContent) {
                 currentCardContent = content;
+                // Global değişkeni güncelle
+                currentTagValue = content;
                 
                 Serial.print("Kart algılandı. Okunan içerik: ");
                 Serial.println(content.length() > 0 ? content : "(Boş)");
@@ -344,6 +360,8 @@ void rfidTask(void* parameter) {
           xQueueSend(tagQueue, &emptyTag, 0);
           
           currentCardContent = "";
+          // Global değişkeni temizle
+          currentTagValue = "";
           cardPresent = false;
         }
       }
@@ -353,6 +371,7 @@ void rfidTask(void* parameter) {
   }
 }
 
+// Veri işleme
 void dataProcessTask(void* parameter) {
   TagData receivedTag;
   String lastProcessedTag = "";
@@ -404,6 +423,8 @@ void dataProcessTask(void* parameter) {
         xQueueSend(tagQueue, &emptyTag, 0);
         lastProcessedTag = "";
         tagActive = false;
+        // Global değişkeni temizle
+        currentTagValue = "";
         xSemaphoreGive(dataAccessMutex);
       }
     }
@@ -411,172 +432,87 @@ void dataProcessTask(void* parameter) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
+
+// Arayüzü döndürür
+void handleRoot() {
+  String currentTag = "";
+  
+  if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    TagData tag;
+    if (xQueuePeek(tagQueue, &tag, 0) == pdTRUE) {
+      currentTag = tag.content;
+    }
+    xSemaphoreGive(dataAccessMutex);
+  }
+  
+  bool isVeriKontrol = (server.arg("action") == "veriKontrol");
+  bool isKimlikGuncelle = (server.arg("action") == "kimlikGuncelle");
+  bool isKimlikBelirleme = (server.arg("action") == "kimlikBelirleme");
+  String selectedOrgan = server.hasArg("organ") ? server.arg("organ") : "KALP";
+  
+  server.send(200, "text/html", createHtmlPage(currentTag, isVeriKontrol, isKimlikGuncelle, isKimlikBelirleme, selectedOrgan).c_str());
+}
+
+// Kart işlem durumunu takip eder
+void handleCardStatus() {
+  String status = "";
+  
+  if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (cardOp.isProcessing) {
+      status = "İşlem devam ediyor...";
+    } else if (cardOp.status != "") {
+      status = cardOp.status;
+      if (cardOp.status == "Kimlik güncellendi!" || 
+          cardOp.status == "Kimlik belirlendi!" || 
+          cardOp.status.indexOf("iptal edildi") >= 0) {
+        cardOp.status = "";
+      }
+    } else if (cardOp.isUpdateRequested || writeRequested) {
+      status = "Kartı okutun...";
+    }
+    xSemaphoreGive(cardOpMutex);
+  }
+  
+  server.send(200, "text/plain", status);
+}
+
+// Kimlik güncelleme
+void handleUpdate() {
+  if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    cardOp.isUpdateRequested = true;
+    cardOp.newValue = server.arg("organ");
+    xSemaphoreGive(cardOpMutex);
+  }
+  
+  server.sendHeader("Location", "/?action=kimlikGuncelle", true);
+  server.send(303, "text/plain", "");
+}
+
+// Boş karta kimlik yazma
+void handleSetKimlik() {
+  if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    cardOp.newValue = server.arg("organ");
+    writeRequested = true;
+    xSemaphoreGive(cardOpMutex);
+  }
+  
+  server.sendHeader("Location", "/?action=kimlikBelirleme", true);
+  server.send(303, "text/plain", "");
+}
+
+// WebServer işlemleri
 void webServerTask(void* parameter) {
+  // Route'ları tanımla
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/cardstatus", HTTP_GET, handleCardStatus);
+  server.on("/tag-durumu", HTTP_GET, handleTagDurumu);
+  server.on("/update", HTTP_GET, handleUpdate);
+  server.on("/setkimlik", HTTP_GET, handleSetKimlik);
+  
   server.begin();
-  String lastTag = "";
-  bool updateRequested = false;
-  bool localWriteRequested = false;
-  String selectedOrgan = "KALP";
-  unsigned long lastCheck = 0;
   
   while (1) {
-    unsigned long currentTime = millis();
-    
-    if (currentTime - lastCheck > 200) { 
-      if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        TagData tag;
-        if (xQueuePeek(tagQueue, &tag, 0) == pdTRUE) {
-          lastTag = tag.content;
-        }
-        xSemaphoreGive(dataAccessMutex);
-      }
-      lastCheck = currentTime;
-    }
-    
-    WiFiClient client = server.available();
-    if (client) {
-      String currentLine = "";
-      String request = "";
-      String currentTag = "";
-    
-      if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        TagData tag;
-        if (xQueuePeek(tagQueue, &tag, 0) == pdTRUE) {
-          currentTag = tag.content;
-        }
-        xSemaphoreGive(dataAccessMutex);
-      }
-      
-      while (client.connected()) {
-        if (client.available()) {
-          char c = client.read();
-          request += c;
-          if (c == '\n') {
-            if (currentLine.length() == 0) {
-              bool isVeriKontrol = (request.indexOf("GET /?action=veriKontrol") >= 0);
-              bool isKimlikGuncelle = (request.indexOf("GET /?action=kimlikGuncelle") >= 0);
-              bool isKimlikBelirleme = (request.indexOf("GET /?action=kimlikBelirleme") >= 0);
-      
-              if (request.indexOf("GET /cardstatus") >= 0) {
-                client.println("HTTP/1.1 200 OK");
-                client.println("Content-Type: text/plain");
-                client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-                client.println("Pragma: no-cache");
-                client.println("Expires: 0");
-                client.println("Connection: close");
-                client.println();
-                
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  if (cardOp.isProcessing) {
-                    client.println("İşlem devam ediyor...");
-                  } else if (cardOp.status != "") {
-                    client.println(cardOp.status);
-                    if (cardOp.status == "Kimlik güncellendi!" || 
-                        cardOp.status == "Kimlik belirlendi!" || 
-                        cardOp.status.indexOf("iptal edildi") >= 0) {
-                      cardOp.status = "";
-                      updateRequested = false;
-                      localWriteRequested = false;
-                      writeRequested = false;
-                    }
-                  } else if (updateRequested || localWriteRequested) {
-                    client.println("Kartı okutun...");
-                  } else {
-                    client.println("");
-                  }
-                  xSemaphoreGive(cardOpMutex);
-                }
-                break;
-              }
-              
-              if (request.indexOf("GET /tagstatus") >= 0) {
-                client.println("HTTP/1.1 200 OK");
-                client.println("Content-Type: text/plain");
-                client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-                client.println("Pragma: no-cache");
-                client.println("Expires: 0");
-                client.println("Connection: close");
-                client.println();
-                
-                // Debug bilgisi
-                Serial.print("Tag durumu sorgulandı, şu anki değer: [");
-                Serial.print(currentTag);
-                Serial.println("]");
-                
-                client.println(currentTag);  
-                break;
-              }
-              
-              if (request.indexOf("GET /update") >= 0) {
-                updateRequested = true;
-                localWriteRequested = false;
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  cardOp.isUpdateRequested = true;
-                  xSemaphoreGive(cardOpMutex);
-                }
-                int organStart = request.indexOf("organ=") + 6;
-                int organEnd = request.indexOf(" ", organStart);
-                if (organEnd == -1) organEnd = request.length();
-                selectedOrgan = request.substring(organStart, organEnd);
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  cardOp.newValue = selectedOrgan;
-                  xSemaphoreGive(cardOpMutex);
-                }
-                
-                client.println("HTTP/1.1 303 See Other");
-                client.println("Location: /?action=kimlikGuncelle");
-                client.println("Connection: close");
-                client.println();
-                break;
-              }
-
-              if (request.indexOf("GET /setkimlik") >= 0) {
-                localWriteRequested = true;
-                updateRequested = false;
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  cardOp.isUpdateRequested = false;
-                  xSemaphoreGive(cardOpMutex);
-                }
-                int organStart = request.indexOf("organ=") + 6;
-                int organEnd = request.indexOf(" ", organStart);
-                if (organEnd == -1) organEnd = request.length();
-                selectedOrgan = request.substring(organStart, organEnd);
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  cardOp.newValue = selectedOrgan;
-                  xSemaphoreGive(cardOpMutex);
-                }
-                if(xSemaphoreTake(cardOpMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                  writeRequested = true;
-                  xSemaphoreGive(cardOpMutex);
-                }
-                
-                client.println("HTTP/1.1 303 See Other");
-                client.println("Location: /?action=kimlikBelirleme");
-                client.println("Connection: close");
-                client.println();
-                break;
-              }
-              
-              client.println("HTTP/1.1 200 OK");
-              client.println("Content-type: text/html");
-              client.println("Connection: close");
-              client.println("Cache-Control: no-store, must-revalidate");
-              client.println();
-              
-              client.print(createHtmlPage(currentTag, isVeriKontrol, isKimlikGuncelle, isKimlikBelirleme, selectedOrgan).c_str());
-              break;
-            } else {
-              currentLine = "";
-            }
-          } else if (c != '\r') {
-            currentLine += c;
-          }
-        }
-      }
-      
-      delay(1);
-      client.stop();
-    }
+    server.handleClient();
     vTaskDelay(pdMS_TO_TICKS(20));  
   }
 }
